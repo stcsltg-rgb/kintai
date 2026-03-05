@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>勤怠管理</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📋</text></svg>">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Noto Sans JP','DM Mono',sans-serif;min-height:100vh;background:linear-gradient(160deg,#f0f0ff 0%,#e8f4f8 50%,#f5f0ff 100%)}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+// ═══════════════════════════════════════
+// GAS API
+// ═══════════════════════════════════════
+const CFG_KEY = "att_gas_url";
+const loadUrl = () => localStorage.getItem(CFG_KEY) || "";
+const saveUrl = (u) => localStorage.setItem(CFG_KEY, u);
+
+async function gasGet(baseUrl, action, params = {}) {
+  const url = new URL(baseUrl);
+  url.searchParams.set("action", action);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function gasPost(baseUrl, action, body, params = {}) {
+  const url = new URL(baseUrl);
+  url.searchParams.set("action", action);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url.toString(), { method: "POST", body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+// ═══════════════════════════════════════
+// Time utilities
+// ═══════════════════════════════════════
+const pad = (n) => String(n).padStart(2, "0");
+const fmtDate = (d) => `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())}`;
+const weekday = (d) => ["日", "月", "火", "水", "木", "金", "土"][d.getDay()];
+const todayStr = () => fmtDate(new Date());
+const fmtYen = (n) => n ? `¥${Number(n).toLocaleString()}` : "—";
+
+function timeOpts(startH, endH) {
+  const o = [];
+  for (let h = startH; h <= endH; h++) {
+    const dh = h >= 24 ? h - 24 : h; const pfx = h >= 24 ? "翌" : "";
+    for (let m = 0; m < 60; m += 15) { if (h === endH && m > 0) break; o.push({ value: `${pad(h)}:${pad(m)}`, label: `${pfx}${pad(dh)}:${pad(m)}` }); }
+  }
+  return o;
+}
+const DAY_START_OPTS = timeOpts(8, 16);
+const DAY_END_OPTS = timeOpts(17, 23);
+const NIGHT_START_OPTS = timeOpts(17, 23);
+const NIGHT_END_OPTS = (() => { const o = []; for (let h = 18; h <= 32; h++) { const dh = h >= 24 ? h - 24 : h; const pfx = h >= 24 ? "翌" : ""; for (let m = 0; m < 60; m += 15) { if (h === 32 && m > 0) break; o.push({ value: `${pad(h)}:${pad(m)}`, label: `${pfx}${pad(dh)}:${pad(m)}` }); } } return o; })();
+
+const toMins = (t) => { if (!t) return 0; const [h, m] = t.split(":").map(Number); return h * 60 + m; };
+const fmtDur = (mins) => { if (mins == null || mins <= 0) return "—"; return `${Math.floor(mins / 60)}h${pad(mins % 60)}m`; };
+function calcShift(start, end, brk) { if (!start || !end) return 0; let s = toMins(start), e = toMins(end); if (e <= s) e += 1440; return Math.max(0, e - s - (brk || 0)); }
+function calcDeepNight(start, end) { if (!start || !end) return 0; let s = toMins(start), e = toMins(end); if (e <= s) e += 1440; let t = 0; for (const [rs, re] of [[0,300],[1320,1440],[1440,1740],[2760,2880]]) t += Math.max(0, Math.min(e, re) - Math.max(s, rs)); return t; }
+function dispTime(t) { if (!t) return "—"; const [h, m] = t.split(":").map(Number); if (h >= 24) return `翌${pad(h-24)}:${pad(m)}`; return `${pad(h)}:${pad(m)}`; }
+function calcHourlyPay(start, end, brk, hourlyRate) {
+  const mins = calcShift(start, end, brk);
+  if (mins <= 0 || !hourlyRate) return 0;
+  return Math.round(hourlyRate * mins / 60);
+}
+
+const emptyDay = () => ({ start: "", end: "", breakMins: 60, memo: "", destination: "" });
+const emptyNight = () => ({ start: "", end: "", breakMins: 0, memo: "", destination: "" });
+
+// CSV
+function exportCSV(records, users) {
+  const umap = {}; const tmap = {}; users.forEach((u) => { umap[u.id] = u.name; tmap[u.id] = u.type; });
+  const sorted = [...records].sort((a, b) => a.userId === b.userId ? (b.date > a.date ? 1 : -1) : a.userId.localeCompare(b.userId));
+  const q = (s) => `"${(s||"").replace(/"/g,'""')}"`;
+  const header = "ユーザー,タイプ,日付,曜日,日中出勤,日中退勤,日中休憩(分),日中実働(分),日中行き先,日中メモ,日中給与,日中交通費,夜間出勤,夜間退勤,夜間休憩(分),夜間実働(分),夜間行き先,夜間メモ,夜間現場名,夜間日給,夜間交通費,深夜時間(分),合計実働(分),合計支給額";
+  const rows = sorted.map((r) => {
+    const d = new Date(r.date.replace(/\//g, "-")); const dw = calcShift(r.day?.start, r.day?.end, r.day?.breakMins); const nw = calcShift(r.night?.start, r.night?.end, r.night?.breakMins); const deep = calcDeepNight(r.night?.start, r.night?.end);
+    const utype = tmap[r.userId] || "staff";
+    const totalPay = (r.dayPay||0) + (r.dayTransportPay||0) + (r.nightDailyPay||0) + (r.nightTransportPay||0);
+    return [umap[r.userId]||r.userId, utype, r.date, weekday(d), r.day?.start?dispTime(r.day.start):"", r.day?.end?dispTime(r.day.end):"", r.day?.breakMins||0, dw, q(r.day?.destination), q(r.day?.memo), r.dayPay||0, r.dayTransportPay||0, r.night?.start?dispTime(r.night.start):"", r.night?.end?dispTime(r.night.end):"", r.night?.breakMins||0, nw, q(r.night?.destination), q(r.night?.memo), q(r.nightSite), r.nightDailyPay||0, r.nightTransportPay||0, deep, dw+nw, totalPay].join(",");
+  });
+  const blob = new Blob(["\uFEFF"+header+"\n"+rows.join("\n")], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = `勤怠データ_${fmtDate(new Date()).replace(/\//g,"")}.csv`; a.click(); URL.revokeObjectURL(url);
+}
+
+// ═══════════════════════════════════════
+// Styles
+// ═══════════════════════════════════════
+const cardS = { background: "#fff", borderRadius: 20, boxShadow: "0 4px 30px rgba(99,102,241,.08), 0 1px 3px rgba(0,0,0,.04)", padding: "20px 22px", marginBottom: 16 };
+const inputS = { width: "100%", boxSizing: "border-box", borderRadius: 10, border: "1px solid #e2e8f0", padding: "9px 12px", fontSize: 14, fontFamily: "inherit", outline: "none", background: "#f8fafc", transition: "border .15s" };
+const inputSmS = { ...inputS, fontSize: 13, padding: "7px 10px" };
+const selectS = { ...inputS, cursor: "pointer", appearance: "none", backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%2394a3b8' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10z'/%3E%3C/svg%3E")`, backgroundRepeat: "no-repeat", backgroundPosition: "right 10px center", paddingRight: 30 };
+const btnP = (color = "#6366f1") => ({ padding: "11px 24px", borderRadius: 12, border: "none", background: color, color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer", transition: "all .15s", boxShadow: `0 4px 14px ${color}44`, width: "100%" });
+const labelS = { fontSize: 11, fontWeight: 600, color: "#64748b", marginBottom: 3, display: "block" };
+
+// ═══════════════════════════════════════
+// Tiny components
+// ═══════════════════════════════════════
+function TimeSelect({ value, onChange, label, options }) {
+  return (<div style={{ flex: 1, minWidth: 0 }}><label style={labelS}>{label}</label><select value={value || ""} onChange={(e) => onChange(e.target.value)} style={{ ...selectS, fontSize: 13, padding: "7px 28px 7px 10px" }}><option value="">--:--</option>{options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select></div>);
+}
+function BreakSelect({ value, onChange }) {
+  return (<div style={{ flex: "0 0 68px" }}><label style={labelS}>休憩</label><select value={value ?? 0} onChange={(e) => onChange(Number(e.target.value))} style={{ ...selectS, fontSize: 13, padding: "7px 28px 7px 10px" }}>{[0,15,30,45,60,90,120].map((m) => <option key={m} value={m}>{m === 0 ? "なし" : `${m}分`}</option>)}</select></div>);
+}
+function Chip({ label, value, color = "#1e293b", small }) {
+  return (<div style={{ background: "#f8fafc", borderRadius: 10, padding: small ? "5px 10px" : "8px 12px", border: "1px solid #f0f0f5", textAlign: "center", flex: 1 }}><div style={{ fontSize: 10, color: "#94a3b8", fontWeight: 600, marginBottom: 1 }}>{label}</div><div style={{ fontSize: small ? 13 : 15, fontWeight: 700, color, fontFamily: "'DM Mono', monospace" }}>{value}</div></div>);
+}
+function Err({ msg }) { return msg ? <div style={{ background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 10, padding: "10px 14px", marginBottom: 12, fontSize: 13, color: "#dc2626" }}>{msg}</div> : null; }
+
+// ═══════════════════════════════════════
+// Shift Section (通常スタッフ用)
+// ═══════════════════════════════════════
+function ShiftSection({ shift, onChange, type, compact }) {
+  const isDay = type === "day";
+  const update = (f, v) => onChange({ ...shift, [f]: v });
+  const bg = isDay ? "#fffbeb" : "#eef2ff"; const border = isDay ? "#fef3c7" : "#e0e7ff"; const iconBg = isDay ? "#fef3c7" : "#e0e7ff"; const titleColor = isDay ? "#92400e" : "#3730a3";
+  const icon = isDay ? "☀️" : "🌙"; const title = isDay ? "日中勤務" : "夜間勤務";
+  const startOpts = isDay ? DAY_START_OPTS : NIGHT_START_OPTS; const endOpts = isDay ? DAY_END_OPTS : NIGHT_END_OPTS;
+  const work = calcShift(shift.start, shift.end, shift.breakMins); const deep = !isDay ? calcDeepNight(shift.start, shift.end) : 0;
+  return (
+    <div style={{ background: bg, borderRadius: compact ? 12 : 14, padding: compact ? "12px 14px" : "14px 16px", marginBottom: compact ? 8 : 12, border: `1px solid ${border}` }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: compact ? 24 : 28, height: compact ? 24 : 28, borderRadius: 8, background: iconBg, fontSize: compact ? 12 : 14 }}>{icon}</span>
+        <span style={{ fontSize: compact ? 13 : 14, fontWeight: 700, color: titleColor }}>{title}</span>
+        {work > 0 && <span style={{ marginLeft: "auto", fontSize: 12, fontWeight: 700, color: titleColor, fontFamily: "'DM Mono', monospace" }}>{fmtDur(work)}</span>}
+      </div>
+      <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+        <TimeSelect label="出勤" value={shift.start} onChange={(v) => update("start", v)} options={startOpts} />
+        <TimeSelect label="退勤" value={shift.end} onChange={(v) => update("end", v)} options={endOpts} />
+        <BreakSelect value={shift.breakMins} onChange={(v) => update("breakMins", v)} />
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <div style={{ flex: "0 0 40%" }}><label style={labelS}>行き先</label><input value={shift.destination || ""} onChange={(e) => update("destination", e.target.value)} placeholder="行き先" style={inputSmS} /></div>
+        <div style={{ flex: 1 }}><label style={labelS}>業務内容</label><input value={shift.memo || ""} onChange={(e) => update("memo", e.target.value)} placeholder="業務内容メモ" style={inputSmS} /></div>
+      </div>
+      {!isDay && deep > 0 && <div style={{ display: "flex", gap: 8, marginTop: 8 }}><Chip label="うち深夜" value={fmtDur(deep)} color="#7c3aed" small /></div>}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════
+// Baito Day Section (バイト日中用 — 時給制)
+// ═══════════════════════════════════════
+function BaitoDaySection({ shift, onChange, hourlyPay, dayTransportPay, compact }) {
+  const update = (f, v) => onChange({ ...shift, [f]: v });
+  const work = calcShift(shift.start, shift.end, shift.breakMins);
+  const pay = calcHourlyPay(shift.start, shift.end, shift.breakMins, hourlyPay);
+  return (
+    <div style={{ background: "#fffbeb", borderRadius: compact ? 12 : 14, padding: compact ? "12px 14px" : "14px 16px", marginBottom: compact ? 8 : 12, border: "1px solid #fef3c7" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: compact ? 24 : 28, height: compact ? 24 : 28, borderRadius: 8, background: "#fef3c7", fontSize: compact ? 12 : 14 }}>☀️</span>
+        <span style={{ fontSize: compact ? 13 : 14, fontWeight: 700, color: "#92400e" }}>日中勤務（時給制）</span>
+        {work > 0 && <span style={{ marginLeft: "auto", fontSize: 12, fontWeight: 700, color: "#92400e", fontFamily: "'DM Mono', monospace" }}>{fmtDur(work)}</span>}
+      </div>
+      <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+        <TimeSelect label="出勤" value={shift.start} onChange={(v) => update("start", v)} options={DAY_START_OPTS} />
+        <TimeSelect label="退勤" value={shift.end} onChange={(v) => update("end", v)} options={DAY_END_OPTS} />
+        <BreakSelect value={shift.breakMins} onChange={(v) => update("breakMins", v)} />
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <div style={{ flex: "0 0 40%" }}><label style={labelS}>行き先</label><input value={shift.destination || ""} onChange={(e) => update("destination", e.target.value)} placeholder="行き先" style={inputSmS} /></div>
+        <div style={{ flex: 1 }}><label style={labelS}>業務内容</label><input value={shift.memo || ""} onChange={(e) => update("memo", e.target.value)} placeholder="業務内容メモ" style={inputSmS} /></div>
+      </div>
+      {work > 0 && (
+        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+          <Chip label={`時給${fmtYen(hourlyPay)}×${fmtDur(work)}`} value={fmtYen(pay)} color="#059669" small />
+          <Chip label="交通費" value={fmtYen(dayTransportPay)} color="#0284c7" small />
+          <Chip label="小計" value={fmtYen(pay + dayTransportPay)} color="#1e293b" small />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════
+// Night Site Section (バイト夜間用 — 現場名のみ)
+// ═══════════════════════════════════════
+function NightSiteSection({ nightSite, onChange, nightDailyPay, nightTransportPay, compact }) {
+  return (
+    <div style={{ background: "#eef2ff", borderRadius: compact ? 12 : 14, padding: compact ? "12px 14px" : "14px 16px", marginBottom: compact ? 8 : 12, border: "1px solid #e0e7ff" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: compact ? 24 : 28, height: compact ? 24 : 28, borderRadius: 8, background: "#e0e7ff", fontSize: compact ? 12 : 14 }}>🌙</span>
+        <span style={{ fontSize: compact ? 13 : 14, fontWeight: 700, color: "#3730a3" }}>夜間勤務（日給制）</span>
+      </div>
+      <div style={{ marginBottom: 10 }}>
+        <label style={labelS}>現場名 <span style={{ color: "#6366f1" }}>※入力で出勤確認</span></label>
+        <input value={nightSite} onChange={(e) => onChange(e.target.value)} placeholder="現場名を入力してください" style={{ ...inputS, borderColor: nightSite ? "#6366f1" : "#e2e8f0", background: nightSite ? "#f0f0ff" : "#f8fafc" }} />
+      </div>
+      {nightSite && (
+        <div style={{ display: "flex", gap: 8 }}>
+          <Chip label="日給" value={fmtYen(nightDailyPay)} color="#059669" small />
+          <Chip label="交通費" value={fmtYen(nightTransportPay)} color="#0284c7" small />
+          <Chip label="合計" value={fmtYen(nightDailyPay + nightTransportPay)} color="#1e293b" small />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LiveClock() {
+  const [now, setNow] = useState(new Date());
+  useEffect(() => { const id = setInterval(() => setNow(new Date()), 1000); return () => clearInterval(id); }, []);
+  return (<div style={{ textAlign: "center", margin: "4px 0 12px" }}><div style={{ fontFamily: "'DM Mono', monospace", fontSize: 42, fontWeight: 500, letterSpacing: 2, color: "#1a1a2e" }}>{pad(now.getHours())}<span style={{ opacity: now.getSeconds() % 2 ? 0.25 : 1 }}>:</span>{pad(now.getMinutes())}</div><div style={{ fontSize: 14, color: "#6b7280", fontWeight: 500 }}>{fmtDate(now)}（{weekday(now)}）</div></div>);
+}
+
+function Tabs({ tabs, active, onChange }) {
+  return (<div style={{ display: "flex", borderBottom: "2px solid #f1f5f9", marginBottom: 16 }}>{tabs.map((t) => <button key={t.id} onClick={() => onChange(t.id)} style={{ flex: 1, padding: "10px 0", background: "none", border: "none", borderBottom: active === t.id ? "2px solid #6366f1" : "2px solid transparent", marginBottom: -2, color: active === t.id ? "#6366f1" : "#94a3b8", fontWeight: 700, fontSize: 13, cursor: "pointer", transition: "all .15s" }}>{t.label}</button>)}</div>);
+}
+
+// ═══════════════════════════════════════
+// Setup Screen
+// ═══════════════════════════════════════
+function SetupScreen({ onSave }) {
+  const [url, setUrl] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [err, setErr] = useState("");
+
+  const handleSave = async () => {
+    if (!url.trim()) { setErr("URLを入力してください"); return; }
+    setTesting(true); setErr("");
+    try {
+      const res = await gasGet(url.trim(), "getUsers");
+      if (res.error) throw new Error(res.error);
+      saveUrl(url.trim());
+      onSave(url.trim());
+    } catch (e) { setErr(`接続エラー: ${e.message}`); }
+    finally { setTesting(false); }
+  };
+
+  return (
+    <div style={{ width: "100%", maxWidth: 420 }}>
+      <div style={{ textAlign: "center", marginBottom: 24, marginTop: 80 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: "#6366f1", letterSpacing: 3, textTransform: "uppercase" }}>Attendance</div>
+        <h1 style={{ margin: "2px 0 0", fontSize: 24, fontWeight: 700, color: "#1a1a2e" }}>初期設定</h1>
+      </div>
+      <div style={cardS}>
+        <p style={{ fontSize: 13, color: "#64748b", marginBottom: 16, lineHeight: 1.6 }}>Google Apps ScriptのウェブアプリURLを入力してください。</p>
+        <Err msg={err} />
+        <div style={{ marginBottom: 16 }}><label style={labelS}>GAS ウェブアプリURL</label><input value={url} onChange={(e) => setUrl(e.target.value)} style={inputS} placeholder="https://script.google.com/macros/s/..." /></div>
+        <button onClick={handleSave} disabled={testing} style={btnP()}>{testing ? "接続テスト中..." : "接続テスト & 保存"}</button>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════
+// Login
+// ═══════════════════════════════════════
+function LoginScreen({ gasUrl, onLogin, onReset }) {
+  const [name, setName] = useState(""); const [pw, setPw] = useState("");
+  const [err, setErr] = useState(""); const [loading, setLoading] = useState(false);
+
+  const go = async () => {
+    setLoading(true); setErr("");
+    try {
+      const res = await gasGet(gasUrl, "getUsers");
+      if (res.error) throw new Error(res.error);
+      const u = res.users.find((u) => u.name === name && u.password === pw);
+      if (!u) { setErr("名前またはパスワードが正しくありません"); setLoading(false); return; }
+      onLogin(u, res.users);
+    } catch (e) { setErr(`通信エラー: ${e.message}`); }
+    finally { setLoading(false); }
+  };
+
+  return (
+    <div style={{ width: "100%", maxWidth: 380 }}>
+      <div style={{ textAlign: "center", marginBottom: 24, marginTop: 80 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: "#6366f1", letterSpacing: 3, textTransform: "uppercase" }}>Attendance</div>
+        <h1 style={{ margin: "2px 0 0", fontSize: 24, fontWeight: 700, color: "#1a1a2e" }}>勤怠管理</h1>
+      </div>
+      <div style={cardS}>
+        <h2 style={{ fontSize: 17, fontWeight: 700, color: "#1e293b", marginBottom: 18, textAlign: "center" }}>ログイン</h2>
+        <Err msg={err} />
+        <div style={{ marginBottom: 12 }}><label style={labelS}>名前</label><input value={name} onChange={(e) => setName(e.target.value)} style={inputS} placeholder="名前を入力" /></div>
+        <div style={{ marginBottom: 18 }}><label style={labelS}>パスワード</label><input value={pw} onChange={(e) => setPw(e.target.value)} style={inputS} placeholder="パスワードを入力" type="password" onKeyDown={(e) => e.key === "Enter" && go()} /></div>
+        <button onClick={go} disabled={loading} style={btnP()}>{loading ? "ログイン中..." : "ログイン"}</button>
+        <div style={{ textAlign: "center", marginTop: 14 }}><button onClick={onReset} style={{ background: "none", border: "none", color: "#94a3b8", fontSize: 12, cursor: "pointer", textDecoration: "underline" }}>接続設定をリセット</button></div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════
+// Today Form
+// ═══════════════════════════════════════
+function TodayForm({ gasUrl, currentUser, records, onRefresh }) {
+  const isBaito = currentUser.type === "baito";
+  const toInputDate = (s) => s.replace(/\//g, "-");
+  const toDispDate = (s) => s.replace(/-/g, "/");
+  const [selectedDate, setSelectedDate] = useState(todayStr());
+  const curRec = records.find((r) => r.date === selectedDate) || null;
+  const [day, setDay] = useState(curRec?.day || emptyDay());
+  const [night, setNight] = useState(curRec?.night || emptyNight());
+  const [nightSite, setNightSite] = useState(curRec?.nightSite || "");
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    setDay(curRec?.day || emptyDay());
+    setNight(curRec?.night || emptyNight());
+    setNightSite(curRec?.nightSite || "");
+  }, [selectedDate, curRec?.date, records]);
+
+  const dayWork = calcShift(day.start, day.end, day.breakMins);
+  const nightWork = isBaito ? 0 : calcShift(night.start, night.end, night.breakMins);
+  const deepNight = isBaito ? 0 : calcDeepNight(night.start, night.end);
+  const totalWork = dayWork + nightWork;
+  const hasAny = day.start || (isBaito ? nightSite : night.start);
+  const isToday = selectedDate === todayStr();
+  const selDateObj = new Date(toInputDate(selectedDate));
+
+  // バイト給与計算
+  const baitoDayPay = isBaito ? calcHourlyPay(day.start, day.end, day.breakMins, currentUser.hourlyPay) : 0;
+  const baitoNightPay = (isBaito && nightSite) ? currentUser.nightDailyPay : 0;
+  const baitoDayTransport = (isBaito && day.start) ? currentUser.dayTransportPay : 0;
+  const baitoNightTransport = (isBaito && nightSite) ? currentUser.nightTransportPay : 0;
+  const baitoTotal = baitoDayPay + baitoDayTransport + baitoNightPay + baitoNightTransport;
+
+  const handleSave = async () => {
+    setSaving(true); setErr(""); setSaved(false);
+    try {
+      const payload = {
+        userId: currentUser.id,
+        date: selectedDate,
+        day,
+        night: isBaito ? emptyNight() : night,
+        nightSite: isBaito ? nightSite : "",
+        nightDailyPay: baitoNightPay,
+        nightTransportPay: baitoNightTransport,
+        dayPay: baitoDayPay,
+        dayTransportPay: baitoDayTransport
+      };
+      await gasPost(gasUrl, "saveRecord", payload);
+      setSaved(true); setTimeout(() => setSaved(false), 2000); onRefresh();
+    } catch (e) { setErr(`保存エラー: ${e.message}`); }
+    finally { setSaving(false); }
+  };
+
+  const shiftDate = (delta) => { const d = new Date(toInputDate(selectedDate)); d.setDate(d.getDate() + delta); setSelectedDate(fmtDate(d)); };
+
+  return (<><LiveClock />
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, margin: "0 0 14px", flexWrap: "wrap" }}>
+      <button onClick={() => shiftDate(-1)} style={{ background: "none", border: "1px solid #e2e8f0", borderRadius: 8, padding: "4px 10px", fontSize: 16, cursor: "pointer", color: "#6366f1" }}>◀</button>
+      <input type="date" value={toInputDate(selectedDate)} onChange={(e) => setSelectedDate(toDispDate(e.target.value))} style={{ fontFamily: "'DM Mono', monospace", fontSize: 15, fontWeight: 600, padding: "6px 10px", border: "1px solid #e2e8f0", borderRadius: 8, color: "#1e293b", background: isToday ? "#f0fdf4" : "#fffbeb", textAlign: "center" }} />
+      <button onClick={() => shiftDate(1)} style={{ background: "none", border: "1px solid #e2e8f0", borderRadius: 8, padding: "4px 10px", fontSize: 16, cursor: "pointer", color: "#6366f1" }}>▶</button>
+      {!isToday && <button onClick={() => setSelectedDate(todayStr())} style={{ background: "#6366f1", color: "#fff", border: "none", borderRadius: 8, padding: "5px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>今日</button>}
+    </div>
+    {!isToday && <div style={{ textAlign: "center", fontSize: 13, fontWeight: 600, color: "#92400e", background: "#fffbeb", borderRadius: 8, padding: "6px 12px", marginBottom: 10 }}>{selectedDate.slice(5)}（{weekday(selDateObj)}）の入力 {curRec ? "📝 既存データを編集" : "🆕 新規入力"}</div>}
+    <Err msg={err} />
+    {isBaito
+      ? <BaitoDaySection shift={day} onChange={setDay} hourlyPay={currentUser.hourlyPay} dayTransportPay={currentUser.dayTransportPay} />
+      : <ShiftSection shift={day} onChange={setDay} type="day" />
+    }
+    {isBaito
+      ? <NightSiteSection nightSite={nightSite} onChange={setNightSite} nightDailyPay={currentUser.nightDailyPay} nightTransportPay={currentUser.nightTransportPay} />
+      : <ShiftSection shift={night} onChange={setNight} type="night" />
+    }
+    {hasAny && <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+      {isBaito ? (
+        <>
+          <Chip label="日中" value={baitoDayPay > 0 ? fmtYen(baitoDayPay + baitoDayTransport) : "—"} color={baitoDayPay > 0 ? "#059669" : "#cbd5e1"} />
+          <Chip label="夜間" value={baitoNightPay > 0 ? fmtYen(baitoNightPay + baitoNightTransport) : "—"} color={baitoNightPay > 0 ? "#059669" : "#cbd5e1"} />
+          <Chip label="合計支給" value={baitoTotal > 0 ? fmtYen(baitoTotal) : "—"} color={baitoTotal > 0 ? "#1e293b" : "#cbd5e1"} />
+        </>
+      ) : (
+        <>
+          <Chip label="合計実働" value={fmtDur(totalWork)} color={totalWork > 0 ? "#1e293b" : "#cbd5e1"} />
+          <Chip label="深夜時間" value={deepNight > 0 ? fmtDur(deepNight) : "—"} color={deepNight > 0 ? "#7c3aed" : "#cbd5e1"} />
+        </>
+      )}
+    </div>}
+    <button onClick={handleSave} disabled={saving} style={btnP(saved ? "#16a34a" : "#6366f1")}>{saving ? "保存中..." : saved ? "✓ 保存しました" : "保存"}</button></>);
+}
+
+// ═══════════════════════════════════════
+// Edit Form
+// ═══════════════════════════════════════
+function EditForm({ record, gasUrl, onSave, onCancel, currentUser }) {
+  const isBaito = currentUser.type === "baito";
+  const [day, setDay] = useState(record?.day || emptyDay());
+  const [night, setNight] = useState(record?.night || emptyNight());
+  const [nightSite, setNightSite] = useState(record?.nightSite || "");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+
+  const baitoDayPay = isBaito ? calcHourlyPay(day.start, day.end, day.breakMins, currentUser.hourlyPay) : 0;
+  const baitoDayTransport = (isBaito && day.start) ? currentUser.dayTransportPay : 0;
+  const baitoNightPay = (isBaito && nightSite) ? currentUser.nightDailyPay : 0;
+  const baitoNightTransport = (isBaito && nightSite) ? currentUser.nightTransportPay : 0;
+
+  const handleSave = async () => {
+    setSaving(true); setErr("");
+    try {
+      await gasPost(gasUrl, "saveRecord", {
+        userId: record.userId,
+        date: record.date,
+        day,
+        night: isBaito ? emptyNight() : night,
+        nightSite: isBaito ? nightSite : "",
+        nightDailyPay: baitoNightPay,
+        nightTransportPay: baitoNightTransport,
+        dayPay: baitoDayPay,
+        dayTransportPay: baitoDayTransport
+      });
+      onSave();
+    } catch (e) { setErr(`保存エラー: ${e.message}`); } finally { setSaving(false); }
+  };
+
+  return (
+    <div style={{ background: "#fff", border: "2px solid #6366f1", borderRadius: 16, padding: "16px 14px", marginBottom: 10, boxShadow: "0 8px 32px rgba(99,102,241,.15)" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <span style={{ fontSize: 14, fontWeight: 700, color: "#1e293b" }}>📝 {record.date} の修正</span>
+        <button onClick={onCancel} style={{ background: "none", border: "none", color: "#94a3b8", cursor: "pointer", fontSize: 18, lineHeight: 1 }}>✕</button>
+      </div>
+      <Err msg={err} />
+      {isBaito
+        ? <BaitoDaySection shift={day} onChange={setDay} hourlyPay={currentUser.hourlyPay} dayTransportPay={currentUser.dayTransportPay} compact />
+        : <ShiftSection shift={day} onChange={setDay} type="day" compact />
+      }
+      {isBaito
+        ? <NightSiteSection nightSite={nightSite} onChange={setNightSite} nightDailyPay={currentUser.nightDailyPay} nightTransportPay={currentUser.nightTransportPay} compact />
+        : <ShiftSection shift={night} onChange={setNight} type="night" compact />
+      }
+      <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+        <button onClick={onCancel} style={{ flex: 1, padding: "9px", borderRadius: 10, border: "1px solid #e2e8f0", background: "#fff", color: "#64748b", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>キャンセル</button>
+        <button onClick={handleSave} disabled={saving} style={{ flex: 1, padding: "9px", borderRadius: 10, border: "none", background: "#6366f1", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", boxShadow: "0 4px 14px rgba(99,102,241,.3)" }}>{saving ? "保存中..." : "修正を保存"}</button>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════
+// History
+// ═══════════════════════════════════════
+function History({ records, gasUrl, onRefresh, currentUser }) {
+  const isBaito = currentUser.type === "baito";
+  const [editDate, setEditDate] = useState(null);
+  const [expandDate, setExpandDate] = useState(null);
+  const sorted = useMemo(() => [...records].filter((r) => r.day?.start || r.night?.start || r.nightSite).sort((a, b) => (b.date > a.date ? 1 : -1)), [records]);
+  if (sorted.length === 0) return <div style={{ textAlign: "center", padding: "40px 0", color: "#94a3b8", fontSize: 14 }}>勤怠記録はまだありません</div>;
+
+  const cols = isBaito ? "78px 76px 1fr 64px 32px" : "78px 76px 76px 56px 56px 32px";
+  const mono = { fontFamily: "'DM Mono', monospace" };
+
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <div style={{ display: "grid", gridTemplateColumns: cols, gap: 2, padding: "8px 6px", fontSize: 10, fontWeight: 700, color: "#94a3b8", borderBottom: "2px solid #f1f5f9", minWidth: 400 }}>
+        <span>日付</span><span>☀️ 日中</span>
+        {isBaito ? <span>🌙 現場</span> : <span>🌙 夜間</span>}
+        {!isBaito && <span>合計</span>}
+        {isBaito ? <span>支給額</span> : <span>深夜</span>}
+        <span></span>
+      </div>
+      {sorted.map((r) => {
+        const d = new Date(r.date.replace(/\//g, "-"));
+        const dw = calcShift(r.day?.start, r.day?.end, r.day?.breakMins);
+        const nw = isBaito ? 0 : calcShift(r.night?.start, r.night?.end, r.night?.breakMins);
+        const deep = isBaito ? 0 : calcDeepNight(r.night?.start, r.night?.end);
+        const total = dw + nw;
+        const we = d.getDay() === 0 || d.getDay() === 6;
+        const isExp = expandDate === r.date;
+        const totalPay = (r.dayPay||0) + (r.dayTransportPay||0) + (r.nightDailyPay||0) + (r.nightTransportPay||0);
+
+        if (editDate === r.date) return <EditForm key={r.date+"_e"} record={r} gasUrl={gasUrl} currentUser={currentUser} onCancel={() => setEditDate(null)} onSave={() => { setEditDate(null); onRefresh(); }} />;
+        return (<div key={r.date}>
+          <div style={{ display: "grid", gridTemplateColumns: cols, gap: 2, alignItems: "center", padding: "9px 6px", fontSize: 12, borderBottom: isExp ? "none" : "1px solid #f1f5f9", color: we ? "#94a3b8" : "#334155", background: we ? "#fafbfd" : "transparent", minWidth: 400, cursor: "pointer" }}
+            onClick={() => setExpandDate(isExp ? null : r.date)} onMouseEnter={(e) => e.currentTarget.style.background="#f8f7ff"} onMouseLeave={(e) => e.currentTarget.style.background=we?"#fafbfd":"transparent"}>
+            <span style={{ fontWeight: 600, ...mono }}>{r.date.slice(5)}<span style={{ fontSize: 9, marginLeft: 1, color: we ? "#c084fc" : "#94a3b8" }}>({weekday(d)})</span></span>
+            <span style={{ ...mono, fontSize: 11 }}>{r.day?.start ? `${dispTime(r.day.start)}-${dispTime(r.day.end)}` : "—"}</span>
+            {isBaito ? (
+              <span style={{ fontSize: 11, color: r.nightSite ? "#3730a3" : "#cbd5e1", fontWeight: r.nightSite ? 600 : 400, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.nightSite || "—"}</span>
+            ) : (
+              <span style={{ ...mono, fontSize: 11 }}>{r.night?.start ? `${dispTime(r.night.start)}-${dispTime(r.night.end)}` : "—"}</span>
+            )}
+            {!isBaito && <span style={{ ...mono, fontWeight: 700 }}>{fmtDur(total)}</span>}
+            {isBaito ? (
+              <span style={{ ...mono, fontSize: 11, color: totalPay > 0 ? "#059669" : "#cbd5e1", fontWeight: 700 }}>{totalPay > 0 ? fmtYen(totalPay) : "—"}</span>
+            ) : (
+              <span style={{ ...mono, color: deep > 0 ? "#7c3aed" : "#cbd5e1" }}>{deep > 0 ? fmtDur(deep) : "—"}</span>
+            )}
+            <button onClick={(e) => { e.stopPropagation(); setEditDate(r.date); setExpandDate(null); }} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 14, padding: 0, color: "#94a3b8" }}>✏️</button>
+          </div>
+          {isExp && <div style={{ padding: "8px 10px 12px", borderBottom: "1px solid #f1f5f9", background: "#fafbfe", fontSize: 12, color: "#475569", minWidth: 400 }}>
+            {r.day?.start && <div style={{ marginBottom: 6 }}>
+              <span style={{ fontWeight: 700, color: "#92400e", fontSize: 11 }}>☀️ 日中</span>
+              {r.day.destination && <span style={{ marginLeft: 10 }}>📍 {r.day.destination}</span>}
+              {r.day.memo && <span style={{ marginLeft: 10 }}>💬 {r.day.memo}</span>}
+              {isBaito && r.dayPay > 0 && <span style={{ marginLeft: 10, color: "#059669", fontWeight: 600 }}>給与{fmtYen(r.dayPay)} + 交通費{fmtYen(r.dayTransportPay)}</span>}
+            </div>}
+            {isBaito ? (
+              r.nightSite && <div><span style={{ fontWeight: 700, color: "#3730a3", fontSize: 11 }}>🌙 夜間</span><span style={{ marginLeft: 10 }}>🏗️ {r.nightSite}</span><span style={{ marginLeft: 10, color: "#059669", fontWeight: 600 }}>日給{fmtYen(r.nightDailyPay)} + 交通費{fmtYen(r.nightTransportPay)}</span></div>
+            ) : (
+              r.night?.start && <div><span style={{ fontWeight: 700, color: "#3730a3", fontSize: 11 }}>🌙 夜間</span>{r.night.destination && <span style={{ marginLeft: 10 }}>📍 {r.night.destination}</span>}{r.night.memo && <span style={{ marginLeft: 10 }}>💬 {r.night.memo}</span>}</div>
+            )}
+          </div>}
+        </div>);
+      })}
+      {(() => {
+        const tD = sorted.reduce((s, r) => s + calcShift(r.day?.start, r.day?.end, r.day?.breakMins), 0);
+        const tN = isBaito ? 0 : sorted.reduce((s, r) => s + calcShift(r.night?.start, r.night?.end, r.night?.breakMins), 0);
+        const tDp = isBaito ? 0 : sorted.reduce((s, r) => s + calcDeepNight(r.night?.start, r.night?.end), 0);
+        const tPay = isBaito ? sorted.reduce((s, r) => s + (r.dayPay||0) + (r.dayTransportPay||0) + (r.nightDailyPay||0) + (r.nightTransportPay||0), 0) : 0;
+        const nightDays = isBaito ? sorted.filter((r) => r.nightSite).length : 0;
+        return <div style={{ display: "grid", gridTemplateColumns: cols, gap: 2, padding: "10px 6px", fontSize: 12, fontWeight: 700, borderTop: "2px solid #e2e8f0", background: "#f8fafc", color: "#1e293b", minWidth: 400 }}>
+          <span>合計({sorted.length}日)</span>
+          <span style={{ ...mono, fontSize: 11 }}>{fmtDur(tD)}</span>
+          {isBaito ? (
+            <span style={{ fontSize: 11, color: "#3730a3" }}>{nightDays}日出勤</span>
+          ) : (
+            <span style={{ ...mono, fontSize: 11 }}>{fmtDur(tN)}</span>
+          )}
+          {!isBaito && <span style={mono}>{fmtDur(tD+tN)}</span>}
+          {isBaito ? (
+            <span style={{ ...mono, fontSize: 11, color: "#059669" }}>{fmtYen(tPay)}</span>
+          ) : (
+            <span style={{ ...mono, color: "#7c3aed" }}>{fmtDur(tDp)}</span>
+          )}
+          <span></span>
+        </div>;
+      })()}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════
+// Admin
+// ═══════════════════════════════════════
+function AdminPanel({ gasUrl, users, setUsers, currentUser }) {
+  const [allRecords, setAllRecords] = useState([]);
+  const [newName, setNewName] = useState(""); const [newPw, setNewPw] = useState(""); const [newRole, setNewRole] = useState("user");
+  const [newType, setNewType] = useState("staff");
+  const [newHourlyPay, setNewHourlyPay] = useState("");
+  const [newDayTransport, setNewDayTransport] = useState("");
+  const [newNightDailyPay, setNewNightDailyPay] = useState("");
+  const [newNightTransport, setNewNightTransport] = useState("");
+  const [msg, setMsg] = useState(""); const [exportTarget, setExportTarget] = useState("__all__");
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => { gasGet(gasUrl, "getAllRecords").then((r) => { setAllRecords(r.records || []); setLoading(false); }).catch(() => setLoading(false)); }, []);
+
+  const addUser = async () => {
+    if (!newName.trim() || !newPw.trim()) { setMsg("err:名前とパスワードを入力してください"); return; }
+    if (users.find((u) => u.name === newName.trim())) { setMsg("err:同じ名前のユーザーが存在します"); return; }
+    if (newType === "baito" && (!newHourlyPay || Number(newHourlyPay) <= 0) && (!newNightDailyPay || Number(newNightDailyPay) <= 0)) { setMsg("err:バイトの時給または日給を入力してください"); return; }
+    try {
+      const res = await gasPost(gasUrl, "addUser", {
+        name: newName.trim(),
+        password: newPw.trim(),
+        role: newRole,
+        type: newType,
+        hourlyPay: Number(newHourlyPay) || 0,
+        dayTransportPay: Number(newDayTransport) || 0,
+        nightDailyPay: Number(newNightDailyPay) || 0,
+        nightTransportPay: Number(newNightTransport) || 0
+      });
+      if (res.error) throw new Error(res.error);
+      setUsers([...users, { id: res.id, name: newName.trim(), password: newPw.trim(), role: newRole, type: newType, hourlyPay: Number(newHourlyPay) || 0, dayTransportPay: Number(newDayTransport) || 0, nightDailyPay: Number(newNightDailyPay) || 0, nightTransportPay: Number(newNightTransport) || 0 }]);
+      setNewName(""); setNewPw(""); setNewRole("user"); setNewType("staff"); setNewHourlyPay(""); setNewDayTransport(""); setNewNightDailyPay(""); setNewNightTransport("");
+      setMsg(`ok:「${newName.trim()}」を追加しました`); setTimeout(() => setMsg(""), 2500);
+    } catch (e) { setMsg(`err:${e.message}`); }
+  };
+
+  const removeUser = async (u) => {
+    if (u.id === currentUser.id) return;
+    if (!window.confirm(`「${u.name}」を削除しますか？`)) return;
+    try {
+      await gasGet(gasUrl, "deleteUser", { userId: u.id });
+      setUsers(users.filter((x) => x.id !== u.id));
+    } catch (e) { alert("削除エラー: " + e.message); }
+  };
+
+  const filtered = exportTarget === "__all__" ? allRecords : allRecords.filter((r) => r.userId === exportTarget);
+  const typeBadge = (t) => t === "baito"
+    ? { bg: "#fef3c7", color: "#92400e", label: "バイト" }
+    : { bg: "#e0f2fe", color: "#0284c7", label: "スタッフ" };
+  const numOnly = (v) => v.replace(/\D/g, "");
+
+  return (
+    <div>
+      <h3 style={{ fontSize: 15, fontWeight: 700, color: "#1e293b", marginBottom: 10 }}>ユーザー一覧</h3>
+      <div style={{ marginBottom: 16 }}>
+        {users.map((u) => {
+          const tb = typeBadge(u.type);
+          return (<div key={u.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", borderRadius: 10, background: "#f8fafc", marginBottom: 6, border: "1px solid #f0f0f5" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+              <span style={{ fontWeight: 600, fontSize: 14, color: "#1e293b" }}>{u.name}</span>
+              <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 8, background: u.role === "admin" ? "#ede9fe" : "#e0f2fe", color: u.role === "admin" ? "#7c3aed" : "#0284c7", fontWeight: 600 }}>{u.role === "admin" ? "管理者" : "一般"}</span>
+              <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 8, background: tb.bg, color: tb.color, fontWeight: 600 }}>{tb.label}</span>
+              {u.type === "baito" && <span style={{ fontSize: 10, color: "#64748b" }}>日中:時給{fmtYen(u.hourlyPay)}+交{fmtYen(u.dayTransportPay)} / 夜間:日給{fmtYen(u.nightDailyPay)}+交{fmtYen(u.nightTransportPay)}</span>}
+            </div>
+            {u.id !== currentUser.id && <button onClick={() => removeUser(u)} style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: 13, fontWeight: 600 }}>削除</button>}
+          </div>);
+        })}
+      </div>
+
+      <h3 style={{ fontSize: 15, fontWeight: 700, color: "#1e293b", marginBottom: 10 }}>ユーザー追加</h3>
+      <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+        <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="名前" style={{ ...inputS, flex: "1 1 110px" }} />
+        <input value={newPw} onChange={(e) => setNewPw(e.target.value)} placeholder="パスワード" type="password" style={{ ...inputS, flex: "1 1 110px" }} />
+      </div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+        <select value={newRole} onChange={(e) => setNewRole(e.target.value)} style={{ ...selectS, flex: "0 0 85px" }}><option value="user">一般</option><option value="admin">管理者</option></select>
+        <select value={newType} onChange={(e) => setNewType(e.target.value)} style={{ ...selectS, flex: "0 0 110px" }}><option value="staff">スタッフ</option><option value="baito">バイト</option></select>
+      </div>
+      {newType === "baito" && (<>
+        <div style={{ background: "#fffbeb", borderRadius: 10, padding: "10px 12px", border: "1px solid #fef3c7", marginBottom: 8 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#92400e", marginBottom: 6 }}>☀️ 日中（時給制）</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <div style={{ flex: "1 1 120px" }}><label style={labelS}>時給（円）</label><input value={newHourlyPay} onChange={(e) => setNewHourlyPay(numOnly(e.target.value))} placeholder="例: 1200" style={inputSmS} /></div>
+            <div style={{ flex: "1 1 120px" }}><label style={labelS}>交通費（円）</label><input value={newDayTransport} onChange={(e) => setNewDayTransport(numOnly(e.target.value))} placeholder="例: 500" style={inputSmS} /></div>
+          </div>
+        </div>
+        <div style={{ background: "#eef2ff", borderRadius: 10, padding: "10px 12px", border: "1px solid #e0e7ff", marginBottom: 8 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#3730a3", marginBottom: 6 }}>🌙 夜間（日給制）</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <div style={{ flex: "1 1 120px" }}><label style={labelS}>日給（円）</label><input value={newNightDailyPay} onChange={(e) => setNewNightDailyPay(numOnly(e.target.value))} placeholder="例: 12000" style={inputSmS} /></div>
+            <div style={{ flex: "1 1 120px" }}><label style={labelS}>交通費（円）</label><input value={newNightTransport} onChange={(e) => setNewNightTransport(numOnly(e.target.value))} placeholder="例: 1000" style={inputSmS} /></div>
+          </div>
+        </div>
+      </>)}
+      <button onClick={addUser} style={btnP()}>追加</button>
+      {msg && <div style={{ textAlign: "center", marginTop: 10, fontSize: 13, color: msg.startsWith("ok") ? "#16a34a" : "#ef4444" }}>{msg.slice(msg.indexOf(":")+1)}</div>}
+
+      <h3 style={{ fontSize: 15, fontWeight: 700, color: "#1e293b", margin: "20px 0 10px" }}>CSVエクスポート</h3>
+      {loading ? <div style={{ color: "#94a3b8", fontSize: 13 }}>読み込み中...</div> : (
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <select value={exportTarget} onChange={(e) => setExportTarget(e.target.value)} style={{ ...selectS, flex: 1 }}><option value="__all__">全ユーザー</option>{users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}</select>
+          <button onClick={() => exportCSV(filtered, users)} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: "#059669", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap", boxShadow: "0 4px 14px #05966944" }}>CSV出力</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════
+// Main App
+// ═══════════════════════════════════════
+function AttendanceApp() {
+  const [gasUrl, setGasUrl] = useState(loadUrl);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [users, setUsers] = useState([]);
+  const [myRecords, setMyRecords] = useState([]);
+  const [tab, setTab] = useState("today");
+  const [loading, setLoading] = useState(false);
+
+  const isAdmin = currentUser?.role === "admin";
+  const isBaito = currentUser?.type === "baito";
+
+  const loadMyRecords = useCallback(async () => {
+    if (!currentUser || !gasUrl) return;
+    setLoading(true);
+    try {
+      const res = await gasGet(gasUrl, "getRecords", { userId: currentUser.id });
+      setMyRecords(res.records || []);
+    } catch (e) { console.error(e); }
+    finally { setLoading(false); }
+  }, [gasUrl, currentUser]);
+
+  useEffect(() => { loadMyRecords(); }, [loadMyRecords]);
+
+  const handleLogin = (user, allUsers) => { setCurrentUser(user); setUsers(allUsers); };
+  const handleLogout = () => { setCurrentUser(null); setUsers([]); setMyRecords([]); setTab("today"); };
+  const handleReset = () => { localStorage.removeItem(CFG_KEY); setGasUrl(""); handleLogout(); };
+
+  if (!gasUrl) return <SetupScreen onSave={(u) => setGasUrl(u)} />;
+  if (!currentUser) return <LoginScreen gasUrl={gasUrl} onLogin={handleLogin} onReset={handleReset} />;
+
+  const tabList = [{ id: "today", label: "本日の入力" }, { id: "history", label: "勤怠履歴" }, ...(isAdmin ? [{ id: "admin", label: "管理" }] : [])];
+  const typeLabel = isBaito ? "バイト" : (isAdmin ? "管理者" : "一般");
+
+  return (
+    <div style={{ width: "100%", maxWidth: 540 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+        <div><div style={{ fontSize: 12, fontWeight: 700, color: "#6366f1", letterSpacing: 3, textTransform: "uppercase" }}>Attendance</div><h1 style={{ margin: 0, fontSize: 20, fontWeight: 700, color: "#1a1a2e" }}>勤怠管理</h1></div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ textAlign: "right" }}><div style={{ fontSize: 14, fontWeight: 700, color: "#1e293b" }}>{currentUser.name}</div><div style={{ fontSize: 11, color: "#94a3b8" }}>{typeLabel}</div></div>
+          <button onClick={handleLogout} style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid #e2e8f0", background: "#fff", color: "#64748b", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>ログアウト</button>
+        </div>
+      </div>
+      <div style={cardS}>
+        <Tabs tabs={tabList} active={tab} onChange={setTab} />
+        {loading && tab !== "admin" ? <div style={{ textAlign: "center", padding: 24, color: "#94a3b8" }}>読み込み中...</div> : <>
+          {tab === "today" && <TodayForm gasUrl={gasUrl} currentUser={currentUser} records={myRecords} onRefresh={loadMyRecords} />}
+          {tab === "history" && <History records={myRecords} gasUrl={gasUrl} onRefresh={loadMyRecords} currentUser={currentUser} />}
+          {tab === "admin" && isAdmin && <AdminPanel gasUrl={gasUrl} users={users} setUsers={setUsers} currentUser={currentUser} />}
+        </>}
+      </div>
+      <div style={{ textAlign: "center", fontSize: 11, color: "#b0b8c8" }}>データはGoogleスプレッドシートに保存されます<span style={{ margin: "0 6px" }}>|</span><button onClick={handleReset} style={{ background: "none", border: "none", color: "#b0b8c8", fontSize: 11, cursor: "pointer", textDecoration: "underline" }}>接続設定</button></div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(AttendanceApp));
+</script>
+</body>
+</html>
